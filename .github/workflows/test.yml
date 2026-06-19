@@ -1,15 +1,15 @@
 name: Autograde
 
 # Runs the test suite on every push so graders see a pass/fail at a glance, and
-# renders a screenshot of index.html. Each run saves a timestamped screenshot
-# under submission/ and links it from the run summary. Works on private repos;
-# no GitHub Pages needed.
+# renders a screenshot of every HTML page. Each run saves a timestamped folder
+# under submission/<timestamp>/ (one image per page + a README that embeds them)
+# and links it from the run summary. Works on private repos; no Pages needed.
 on:
   push:
   workflow_dispatch:
 
 permissions:
-  contents: write   # lets the preview step commit the screenshot back
+  contents: write   # lets the preview step commit the screenshots back
 
 jobs:
   test:
@@ -43,27 +43,60 @@ jobs:
         run: |
           TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
           echo "TS=$TS" >> "$GITHUB_ENV"
-          mkdir -p submission
           cat > shot.mjs <<'EOF'
           import { chromium } from 'playwright'
           import { pathToFileURL } from 'node:url'
-          const out = process.argv[2] || 'page-preview.png'
+          import { readdirSync, mkdirSync, writeFileSync } from 'node:fs'
+
+          const ts = process.argv[2] || 'preview'
+          const outDir = `submission/${ts}`
+          mkdirSync(outDir, { recursive: true })
+
+          const skip = new Set(['node_modules', 'test', 'tests', 'submission', 'previews'])
+          function listHtml(dir, rel = '') {
+            const out = []
+            for (const e of readdirSync(dir, { withFileTypes: true })) {
+              if (e.name.startsWith('.') || skip.has(e.name)) continue
+              const r = rel ? `${rel}/${e.name}` : e.name
+              if (e.isDirectory()) out.push(...listHtml(`${dir}/${e.name}`, r))
+              else if (e.name.toLowerCase().endsWith('.html')) out.push(r)
+            }
+            return out
+          }
+          const pages = listHtml('.').sort((a, b) =>
+            (a === 'index.html' ? '' : a).localeCompare(b === 'index.html' ? '' : b))
+
           const browser = await chromium.launch()
+          const done = []
           try {
-            const page = await browser.newPage({ viewport: { width: 1024, height: 800 } })
-            await page.goto(pathToFileURL('index.html').href, { waitUntil: 'load', timeout: 15000 }).catch(() => {})
-            await page.screenshot({ path: out, fullPage: true })
+            for (const rel of pages) {
+              const img = (rel.replace(/\.html$/i, '').replace(/[\/\\]/g, '-') || 'index') + '.png'
+              try {
+                const page = await browser.newPage({ viewport: { width: 1024, height: 800 } })
+                await page.goto(pathToFileURL(rel).href, { waitUntil: 'load', timeout: 15000 }).catch(() => {})
+                await page.screenshot({ path: `${outDir}/${img}`, fullPage: true })
+                await page.close()
+                done.push({ rel, img })
+              } catch {}
+            }
           } finally {
             await browser.close()
           }
+          const md = [
+            `# Submission preview - ${ts}`, '',
+            'Rendered screenshot(s) of your page(s) at this submission (UTC).', '',
+            ...done.flatMap((p) => [`## ${p.rel}`, '', `![${p.rel}](./${p.img})`, '']),
+          ].join('\n')
+          writeFileSync(`${outDir}/README.md`, md)
+          console.log(`pages: ${done.length}`)
           EOF
-          node shot.mjs "submission/$TS.png"
+          node shot.mjs "$TS"
 
       - name: Commit preview
         if: always()
         continue-on-error: true
         run: |
-          [ -n "$TS" ] && [ -f "submission/$TS.png" ] || exit 0
+          [ -n "$TS" ] && [ -d "submission/$TS" ] || exit 0
           git config user.name "course-bot"
           git config user.email "course-bot@users.noreply.github.com"
           git add submission
@@ -94,8 +127,8 @@ jobs:
           }
           const ts = process.env.TS;
           if (ts) {
-            const url = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/blob/${process.env.GITHUB_REF_NAME}/submission/${ts}.png`;
+            const url = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/blob/${process.env.GITHUB_REF_NAME}/submission/${ts}/README.md`;
             console.log('');
-            console.log(`📸 **Page preview:** [view rendered \`index.html\` (${ts})](${url})`);
+            console.log(`📸 **Page preview:** [view rendered page(s) (${ts})](${url})`);
           }
           EOF
